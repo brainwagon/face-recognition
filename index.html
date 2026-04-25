@@ -711,7 +711,8 @@
     let lastFrameTime = 0;
     let smoothedFps   = 0;
 
-    // Per-phase timing (EMA-smoothed, ms).  -1 = not yet measured.
+    // Per-phase timing (ms).  -1 = not yet measured.  Stored as raw last-frame
+    // values so the overlay reflects the current frame immediately.
     let smoothedPipelineMs = -1;   // neural-net inference (detect + landmarks + descriptors)
     let smoothedMatchMs    = -1;   // FaceMatcher DB lookup
     let smoothedRenderMs   = -1;   // canvas drawing
@@ -826,8 +827,6 @@
         .withFaceLandmarks()
         .withFaceDescriptors();
       const pipelineMs = performance.now() - pipelineStart;
-      smoothedPipelineMs = smoothedPipelineMs < 0 ? pipelineMs
-                         : smoothedPipelineMs * 0.85 + pipelineMs * 0.15;
 
       // Scale coordinates from the network's input size to canvas pixel dimensions
       const resized = faceapi.resizeResults(detections, { width: W, height: H });
@@ -851,12 +850,21 @@
         return { label: 'Unknown', boxColor: 'rgba(255,100,100,0.85)' };
       });
       const matchMs = performance.now() - matchStart;
-      smoothedMatchMs = smoothedMatchMs < 0 ? matchMs
-                      : smoothedMatchMs * 0.85 + matchMs * 0.15;
 
       // ── Phase 3: Canvas rendering ─────────────────────────────────────────────
       const renderStart = performance.now();
       ctx.clearRect(0, 0, W, H);
+
+      // Build face drawing commands first so renderMs covers only canvas work,
+      // and compute overhead before any draws so all four timing values are
+      // current-frame figures when drawTimings() reads them.
+      const overheadMs = Math.max(0, performance.now() - frameStart - pipelineMs - matchMs);
+      smoothedPipelineMs = pipelineMs;
+      smoothedMatchMs    = matchMs;
+      smoothedOverheadMs = overheadMs;
+      // smoothedRenderMs will be set at end of this phase; prime it to the
+      // previous frame's value so drawTimings() always has something to show.
+
       if (smoothedFps > 0) drawFps();
       drawTimings();
 
@@ -890,14 +898,7 @@
         });
         infoEl.textContent = angleLines.join(' | ');
       }
-      const renderMs = performance.now() - renderStart;
-      smoothedRenderMs = smoothedRenderMs < 0 ? renderMs
-                       : smoothedRenderMs * 0.85 + renderMs * 0.15;
-
-      // Overhead = everything in the loop not captured by the three timed phases.
-      const overheadMs = Math.max(0, performance.now() - frameStart - pipelineMs - matchMs - renderMs);
-      smoothedOverheadMs = smoothedOverheadMs < 0 ? overheadMs
-                         : smoothedOverheadMs * 0.85 + overheadMs * 0.15;
+      smoothedRenderMs = performance.now() - renderStart;
 
       // Schedule the next frame — only after this frame's inference is complete
       requestAnimationFrame(detectLoop);
