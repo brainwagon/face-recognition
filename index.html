@@ -1,10 +1,42 @@
 <!DOCTYPE html>
+<!--
+  Face Pose & Recognition Demo
+  ============================
+  A single-file, build-less web application that demonstrates real-time face
+  detection, landmark overlay, head pose estimation, and face recognition
+  entirely in the browser — no server, no npm, no build step.
+
+  The only external dependency is @vladmandic/face-api, a maintained fork of
+  face-api.js.  Both the JavaScript library and the neural network weight files
+  are fetched at runtime from the jsDelivr CDN, so nothing needs to be
+  installed locally.
+
+  Pipeline overview (runs once per animation frame):
+    1. Webcam frame → SSD MobileNet v1  → bounding boxes for every face
+    2. Each bounding box → faceLandmark68Net → 68 (x,y) landmark points
+    3. Each aligned face chip → faceRecognitionNet → 128-dimensional descriptor
+    4. Each descriptor → FaceMatcher.findBestMatch() → identity or "unknown"
+    5. Landmark points → estimatePose() → yaw / pitch / roll angles
+    6. Everything drawn onto a transparent <canvas> layered over the <video>
+-->
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Face Pose Demo</title>
+
+  <!--
+    face-api.js (vladmandic fork)
+    ─────────────────────────────
+    This single script exposes the `faceapi` global and bundles TensorFlow.js
+    (the inference engine) plus high-level helpers for detection, landmarks,
+    and recognition.  Loading from jsDelivr means the weights files can be
+    fetched from the same CDN path later (see MODEL_URL in the script).
+
+    Source: https://github.com/vladmandic/face-api
+  -->
   <script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.js"></script>
+
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -28,6 +60,24 @@
       text-transform: uppercase;
     }
 
+    /*
+      The mirror trick
+      ────────────────
+      Webcams produce a "true" image: when you raise your right hand it appears
+      on the LEFT side of the frame.  That feels unnatural for a selfie-style
+      view, so we flip the entire #scene container with a CSS transform.
+
+      Because both <video> and <canvas> live inside #scene, both are flipped
+      together.  face-api.js detects faces in the raw (unmirrored) video
+      pixel data, so all detection coordinates are in the unmirrored space.
+      The canvas is also drawn in that same unmirrored space — the CSS flip
+      then makes everything appear correctly mirrored on screen.
+
+      The one exception is text: pixel data drawn on the canvas is mirrored
+      by CSS along with everything else, so text appears backwards.  The fix
+      is in drawLabel() and drawFps(): we pre-mirror the text on the canvas so
+      the CSS flip un-mirrors it.  See those functions for the technique.
+    */
     #scene {
       position: relative;
       display: inline-block;
@@ -38,8 +88,17 @@
       box-shadow: 0 0 32px rgba(100, 180, 255, 0.08);
     }
 
+    /* The live webcam feed.  face-api.js reads pixel data from this element. */
     #video { display: block; max-width: 100%; }
 
+    /*
+      Transparent canvas overlay
+      ──────────────────────────
+      position:absolute + top/left:0 places the canvas exactly over the video.
+      pointer-events:none lets mouse clicks fall through to elements underneath.
+      The canvas width/height (in pixels) is set in JavaScript once the camera
+      stream is active, matching the actual video resolution.
+    */
     #overlay {
       position: absolute;
       top: 0; left: 0;
@@ -108,26 +167,6 @@
     button:hover { background: #253348; }
     button:disabled { opacity: 0.4; cursor: default; }
 
-    #model-form {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      font-size: 0.8rem;
-      padding-bottom: 10px;
-      border-bottom: 1px solid #2a2a3a;
-    }
-
-    .model-label { color: #666; }
-
-    .model-opt {
-      display: flex;
-      align-items: center;
-      gap: 5px;
-      cursor: pointer;
-    }
-
-    .model-opt input[type="radio"] { accent-color: #7ecfff; cursor: pointer; }
-
     #storage-form {
       display: flex;
       gap: 8px;
@@ -177,28 +216,55 @@
     }
     .leg { display: flex; align-items: center; gap: 6px; }
     .dot { width: 12px; height: 4px; border-radius: 2px; }
+
+    footer {
+      font-size: 0.7rem;
+      color: #444;
+      text-align: center;
+      padding-top: 4px;
+    }
   </style>
 </head>
 <body>
 
   <h1>Face Pose &amp; Recognition Demo</h1>
 
+  <!--
+    Layout: video + canvas stacked inside #scene
+    ─────────────────────────────────────────────
+    The <video> element receives the raw webcam stream.  face-api.js can
+    accept an HTMLVideoElement directly — it reads pixel data from the current
+    frame internally via WebGL or a 2-D canvas (depending on the TF.js backend
+    that is available in the browser).
+
+    The <canvas> sits on top (position:absolute) and is where all the
+    overlays are drawn each frame: bounding boxes, landmark dots, pose arrows,
+    and identity labels.  It starts with zero dimensions; init() sets
+    canvas.width / canvas.height to the true camera resolution once the stream
+    is live so that one canvas pixel == one video pixel.
+  -->
   <div id="scene">
     <video id="video" autoplay muted playsinline></video>
     <canvas id="overlay"></canvas>
   </div>
 
+  <!-- Status line: left = pipeline state, right = per-face angle readout -->
   <div id="status-bar">
     <div id="status">Loading models…</div>
     <div id="info"></div>
   </div>
 
+  <!--
+    Enrollment panel
+    ────────────────
+    "Enrolling" means capturing the 128-dim face descriptor produced by
+    faceRecognitionNet for the person currently in frame and associating it
+    with a name.  Multiple samples (captured from different angles) are
+    averaged/compared by FaceMatcher to improve recognition robustness.
+
+    Enrolled data is stored in localStorage so it survives page reloads.
+  -->
   <div id="enroll-panel">
-    <div id="model-form">
-      <span class="model-label">Model:</span>
-      <label class="model-opt"><input type="radio" name="model" value="tiny"> Tiny (fast)</label>
-      <label class="model-opt"><input type="radio" name="model" value="full"> Full (accurate)</label>
-    </div>
     <div id="enroll-form">
       <input id="name-input" type="text" placeholder="Enter name to enroll…" maxlength="30">
       <button id="enroll-btn" disabled>Enroll Face</button>
@@ -209,9 +275,16 @@
       <button id="clear-storage-btn">Clear Saved</button>
     </div>
     <div id="enroll-msg"></div>
+    <!-- Dynamically populated list of enrolled people with sample counts -->
     <div id="enrolled-list"></div>
   </div>
 
+  <!--
+    Pose axis legend.  The three coloured arrows drawn from the nose tip are:
+      Red   = Yaw   (horizontal turn, left/right)
+      Green = Pitch (vertical tilt, up/down)
+      Blue  = Roll  (head tilt, ear toward shoulder)
+  -->
   <div id="legend">
     <div class="leg"><div class="dot" style="background:#ff4444"></div> Yaw</div>
     <div class="leg"><div class="dot" style="background:#44ff88"></div> Pitch</div>
@@ -219,8 +292,24 @@
     <div class="leg"><div class="dot" style="background:rgba(0,255,150,0.75)"></div> Landmarks</div>
   </div>
 
+  <footer id="footer"></footer>
+
   <script>
+    /*
+      Neural network weight files
+      ───────────────────────────
+      face-api.js loads model weights lazily from a URL prefix.  We point it
+      at the same jsDelivr CDN package that served the JavaScript, so the
+      weights are always version-matched to the library and nothing needs to
+      live on disk.
+
+      Each model is a directory of shard files (e.g. ssd_mobilenetv1_model-
+      weights_manifest.json + several .bin shards).  faceapi.nets.*
+      .loadFromUri() fetches and parses these automatically.
+    */
     const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
+
+    // ── DOM references ────────────────────────────────────────────────────────
 
     const video     = document.getElementById('video');
     const canvas    = document.getElementById('overlay');
@@ -234,15 +323,13 @@
     const saveBtn           = document.getElementById('save-btn');
     const loadBtn           = document.getElementById('load-btn');
     const clearStorageBtn   = document.getElementById('clear-storage-btn');
-    const modelRadios       = document.querySelectorAll('input[name="model"]');
-
-    // ── Model selection ───────────────────────────────────────────────────────
-
-    const MODEL_PREF_KEY = 'face-recognition-model';
-    let currentModel = localStorage.getItem(MODEL_PREF_KEY) || 'tiny';
-    document.querySelector(`input[name="model"][value="${currentModel}"]`).checked = true;
 
     // ── Per-person colour palette ─────────────────────────────────────────────
+    /*
+      Each enrolled person gets a consistent colour used for their bounding box
+      and list entry.  colorFor() assigns colours in enrollment order, cycling
+      through the palette if there are more than 8 people.
+    */
 
     const PALETTE = ['#ff6b6b','#ffd93d','#6bcb77','#4d96ff','#ff6fc8','#c77dff','#ff9f45','#48cae4'];
     const nameColors = new Map();
@@ -257,11 +344,37 @@
     }
 
     // ── Enrollment store ──────────────────────────────────────────────────────
+    /*
+      `enrollments` maps each person's name to an array of Float32Array(128)
+      face descriptors — one per captured sample.  FaceMatcher compares live
+      descriptors against all stored samples using Euclidean distance in the
+      128-dimensional embedding space.
+
+      Why multiple samples?  The descriptor for the same person varies slightly
+      with lighting, expression, and head angle.  Enrolling several samples
+      (different lighting, slight turns) gives FaceMatcher more reference
+      points and improves recognition at challenging angles.
+    */
 
     // name → Float32Array[]
     const enrollments = new Map();
     let faceMatcher = null;
 
+    /*
+      rebuildMatcher()
+      ────────────────
+      Wraps the enrollment data in faceapi.LabeledFaceDescriptors and creates
+      a new FaceMatcher.  Must be called any time enrollments change.
+
+      FaceMatcher threshold (0.55): the maximum Euclidean distance between
+      descriptors that is still considered a match.  The embedding space is
+      normalised so distances roughly fall in [0, 1].
+        • Lower threshold (e.g. 0.4) → stricter, fewer false positives but
+          more false negatives (person not recognised at all).
+        • Higher threshold (e.g. 0.7) → more permissive, fewer false negatives
+          but more false positives (wrong person recognised).
+      0.55 is a reasonable default for a single-webcam demo.
+    */
     function rebuildMatcher() {
       if (enrollments.size === 0) { faceMatcher = null; return; }
       const labeled = [...enrollments.entries()].map(
@@ -270,6 +383,7 @@
       faceMatcher = new faceapi.FaceMatcher(labeled, 0.55);
     }
 
+    /* Rebuild the DOM list of enrolled people from the in-memory Map. */
     function renderEnrolledList() {
       enrolledListEl.innerHTML = '';
       for (const [name, descs] of enrollments) {
@@ -295,8 +409,17 @@
     }
 
     // ── localStorage persistence ──────────────────────────────────────────────
+    /*
+      Face descriptors are Float32Array(128) — a typed array that cannot be
+      directly JSON-serialised.  We convert to a plain JS array with
+      Array.from() before stringifying, and reconstruct Float32Array on load.
 
-    const storageKey = () => `face-recognition-enrollments-${currentModel}`;
+      Each descriptor is 128 floats × 4 bytes = 512 bytes.  A person with
+      10 samples uses ~5 KB, so localStorage (5–10 MB typical quota) is
+      plenty even with dozens of enrolled people.
+    */
+
+    const storageKey = () => 'face-recognition-enrollments-full';
 
     function saveToStorage() {
       const data = {};
@@ -333,7 +456,13 @@
     loadBtn.addEventListener('click', loadFromStorage);
     clearStorageBtn.addEventListener('click', clearStorage);
 
-    // ── Latest descriptors from the detection loop ────────────────────────────
+    // ── Enrollment button ─────────────────────────────────────────────────────
+    /*
+      lastDetections is updated each frame by detectLoop().  When the user
+      clicks "Enroll Face" we snapshot the descriptor from the most recent
+      frame.  We require exactly one face to be visible — if there are zero
+      or two+ faces we cannot know which person the user intends to enroll.
+    */
 
     let lastDetections = [];   // [{box, descriptor}]
 
@@ -371,6 +500,7 @@
 
     // ── Geometry helpers ──────────────────────────────────────────────────────
 
+    /* Centroid of an array of {x, y} points. */
     function mean(pts) {
       const n = pts.length;
       return { x: pts.reduce((s,p) => s+p.x, 0)/n, y: pts.reduce((s,p) => s+p.y, 0)/n };
@@ -380,7 +510,46 @@
     function rad2deg(r) { return (r * 180 / Math.PI).toFixed(1); }
 
     // ── Head pose from 68-point landmarks (geometric approximation) ───────────
+    /*
+      The 68-point landmark model indexes points in a standardised layout:
+        0–16   jaw line (left to right)
+        17–21  left eyebrow
+        22–26  right eyebrow
+        27–30  nose bridge
+        30–35  nose base / nostrils
+        36–41  left eye (clockwise)
+        42–47  right eye (clockwise)
+        48–67  mouth (outer then inner)
 
+      From these we derive three Euler angles without solving the full
+      Perspective-n-Point problem (PnP).  The approach is geometric:
+
+      ROLL  — the tilt of the head left/right.
+              Measured as the angle of the line connecting both eye centres.
+              Zero = eyes level; positive = head tilted clockwise.
+
+      PITCH — the tilt of the head up/down.
+              The nose tip sits roughly 45% of the way from the eye midpoint
+              to the chin when looking straight ahead.  If the face tilts up
+              the nose appears higher (closer to the eyes); if it tilts down
+              the nose appears lower (closer to the chin).
+              We normalise this fraction to ±1 around the frontal baseline.
+
+      YAW   — the horizontal turn of the head left/right.
+              When facing straight ahead the nose tip is centred over the
+              jaw midpoint.  As the head turns, the nose shifts toward the
+              near side.  We normalise the offset by half the jaw width so
+              that ±1 ≈ ±90°.
+
+      Tradeoffs of this approach vs. OpenCV solvePnP:
+        + No external library needed; runs in pure JavaScript
+        + Fast — a few arithmetic ops per frame
+        - Not perspective-correct: ignores focal length and distortion
+        - Pitch/yaw estimates saturate and lose accuracy beyond ~30°
+        - Assumes a canonical face shape (everyone's nose is at 45%)
+      For a visual demo this is entirely adequate.  If accuracy matters,
+      replace with OpenCV.js + a full PnP solve.
+    */
     function estimatePose(pts) {
       const leftEye  = mean(pts.slice(36, 42));
       const rightEye = mean(pts.slice(42, 48));
@@ -388,10 +557,15 @@
       const chin     = pts[8];
       const jawL     = pts[0], jawR = pts[16];
 
+      // Roll: angle of the inter-eye axis relative to horizontal
       const roll   = Math.atan2(rightEye.y - leftEye.y, rightEye.x - leftEye.x);
+
+      // Pitch: nose position as fraction of eye-midpoint→chin distance
       const eyeMid = mean([leftEye, rightEye]);
       const faceH  = dist(eyeMid, chin);
       const pitch  = (dist(eyeMid, noseTip) / faceH - 0.45) * 2.2;
+
+      // Yaw: nose offset from jaw centre, normalised to jaw half-width
       const faceW  = dist(jawL, jawR);
       const yaw    = (noseTip.x - mean([jawL, jawR]).x) / (faceW * 0.5);
 
@@ -400,6 +574,12 @@
 
     // ── Canvas drawing ────────────────────────────────────────────────────────
 
+    /*
+      drawArrow — draws a line with a V-shaped arrowhead.
+      (ox, oy)      origin (nose tip in screen coordinates)
+      (dx, dy)      unit-ish direction vector
+      len           length in pixels
+    */
     function drawArrow(ox, oy, dx, dy, color, len) {
       const ex = ox + dx * len, ey = oy + dy * len;
       const angle = Math.atan2(ey - oy, ex - ox);
@@ -415,6 +595,21 @@
       ctx.stroke();
     }
 
+    /*
+      drawPoseAxes — draws three arrows rooted at the nose tip.
+
+      The direction vectors are built in the rotated frame defined by `roll`
+      so the axes stay aligned with the face even as the head tilts.
+
+        Yaw arrow:   along the inter-eye axis, scaled by the yaw value.
+                     Points left/right relative to face orientation.
+        Pitch arrow: perpendicular to the inter-eye axis, scaled by pitch.
+                     Points up/down relative to face orientation.
+        Roll arrow:  fixed-length perpendicular; shows the tilt direction.
+
+      Clamping yaw and pitch to [-1, 1] prevents the arrows from flying
+      off-screen at extreme angles where the geometric estimate saturates.
+    */
     function drawPoseAxes(pose) {
       const { roll, pitch, yaw, noseTip: { x: ox, y: oy } } = pose;
       const yc = Math.max(-1, Math.min(1, yaw));
@@ -430,13 +625,26 @@
       ctx.strokeRect(box.x, box.y, box.width, box.height);
     }
 
+    /*
+      drawLabel — draws a name tag above a bounding box.
+
+      Text drawn on the canvas is pixel data, so it gets flipped horizontally
+      by the CSS scaleX(-1) on #scene and would appear as a mirror image.
+
+      Fix: before drawing, we apply an additional horizontal flip to the canvas
+      context using translate + scale so that CSS flipping it back produces
+      readable text.  The coordinate mapping is:
+        mirrored_x = canvas.width - original_x - text_width
+      We save/restore the context state so this transform is scoped only to the
+      text drawing.
+    */
     function drawLabel(box, text, color) {
       ctx.font = 'bold 13px Courier New';
       const w  = ctx.measureText(text).width + 12;
       const lx = box.x, ly = box.y - 22;
       ctx.fillStyle = 'rgba(0,0,0,0.65)';
       ctx.fillRect(lx, Math.max(0, ly), w, 20);
-      // Flip context locally so text appears correct after the CSS scaleX(-1) on #scene
+      // Pre-mirror text so CSS un-mirrors it back to readable orientation
       ctx.save();
       ctx.translate(canvas.width, 0);
       ctx.scale(-1, 1);
@@ -445,6 +653,7 @@
       ctx.restore();
     }
 
+    /* Draw a 2-pixel dot at each of the 68 landmark positions. */
     function drawLandmarks(pts) {
       ctx.fillStyle = 'rgba(0, 255, 150, 0.75)';
       for (const p of pts) {
@@ -454,82 +663,50 @@
       }
     }
 
-    // ── Model loading & switching ─────────────────────────────────────────────
+    // ── Model loading ─────────────────────────────────────────────────────────
+    /*
+      Three neural networks are loaded in parallel:
 
-    async function loadModels(modelType) {
-      const nets = modelType === 'tiny'
-        ? [faceapi.nets.tinyFaceDetector, faceapi.nets.faceLandmark68TinyNet]
-        : [faceapi.nets.ssdMobilenetv1,   faceapi.nets.faceLandmark68Net];
+      1. ssdMobilenetv1  (face detection)
+         A Single Shot MultiBox Detector built on MobileNet v1.  Given a full
+         video frame it outputs a list of bounding boxes with confidence scores
+         for each detected face.  Runs at the full input resolution but is
+         still fast because MobileNet uses depthwise-separable convolutions.
+
+      2. faceLandmark68Net  (facial landmark detection)
+         For each bounding box produced by step 1, face-api.js crops and
+         resizes the face region, then runs this network to find 68 (x,y)
+         keypoints (eyes, eyebrows, nose, mouth, jaw line).  The landmarks are
+         used to align the face chip before descriptor extraction and to drive
+         the head pose estimation.
+
+      3. faceRecognitionNet  (face embedding)
+         An InceptionResnet V1 architecture trained on a large face dataset
+         (VGGFace2).  It takes an aligned, normalised face chip and outputs a
+         128-dimensional floating-point vector — the "face descriptor" or
+         embedding.  Faces of the same person cluster together in this space;
+         faces of different people are far apart.  Recognition is then just a
+         nearest-neighbour search: find the enrolled descriptor with the
+         smallest Euclidean distance to the live descriptor.
+
+      faceapi.nets.* instances cache their weights after the first load, so
+      calling loadModels() a second time returns immediately.
+    */
+    async function loadModels() {
       await Promise.all([
-        ...nets.map(n => n.loadFromUri(MODEL_URL)),
+        faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL),
+        faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
         faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
       ]);
     }
 
-    async function switchModel(modelType) {
-      if (modelType === currentModel) return;
-
-      // Persist current enrollments silently before clearing
-      if (enrollments.size > 0) {
-        const data = {};
-        for (const [name, descs] of enrollments) data[name] = descs.map(d => Array.from(d));
-        localStorage.setItem(storageKey(), JSON.stringify(data));
-      }
-
-      running = false;
-      enrollBtn.disabled = true;
-      modelRadios.forEach(r => r.disabled = true);
-
-      enrollments.clear();
-      nameColors.clear();
-      colorIdx = 0;
-      faceMatcher = null;
-      lastDetections = [];
-      lastFrameTime = 0;
-      smoothedFps = 0;
-      renderEnrolledList();
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-      currentModel = modelType;
-      localStorage.setItem(MODEL_PREF_KEY, currentModel);
-
-      statusEl.className   = '';
-      statusEl.textContent = `Loading ${modelType} models…`;
-
-      try {
-        await loadModels(modelType);
-      } catch (err) {
-        statusEl.className   = 'error';
-        statusEl.textContent = `Model error: ${err.message}`;
-        modelRadios.forEach(r => r.disabled = false);
-        return;
-      }
-
-      // Restore any enrollments saved under the new model
-      const savedRaw = localStorage.getItem(storageKey());
-      if (savedRaw) {
-        try {
-          const data = JSON.parse(savedRaw);
-          for (const [name, arrays] of Object.entries(data)) {
-            enrollments.set(name, arrays.map(a => new Float32Array(a)));
-            colorFor(name);
-          }
-          rebuildMatcher();
-          renderEnrolledList();
-        } catch (e) { /* corrupt — ignore */ }
-      }
-
-      running = true;
-      enrollBtn.disabled   = false;
-      modelRadios.forEach(r => r.disabled = false);
-      statusEl.className   = 'ready';
-      statusEl.textContent = 'Ready — detecting…';
-      requestAnimationFrame(detectLoop);
-    }
-
-    modelRadios.forEach(r => r.addEventListener('change', () => switchModel(r.value)));
-
     // ── FPS tracking ─────────────────────────────────────────────────────────
+    /*
+      We measure wall-clock time between consecutive detectLoop() calls and
+      compute a smoothed FPS using an exponential moving average (EMA).
+      Alpha = 0.15 means recent frames account for 15% of the displayed value,
+      giving a stable readout that still responds to real throughput changes.
+    */
 
     let lastFrameTime = 0;
     let smoothedFps   = 0;
@@ -542,6 +719,7 @@
       const bx  = 6, by = 6, bw = tw + pad * 2, bh = 20;
       ctx.fillStyle = 'rgba(0,0,0,0.55)';
       ctx.fillRect(bx, by, bw, bh);
+      // Same pre-mirror trick as drawLabel — see that function for explanation
       ctx.save();
       ctx.translate(canvas.width, 0);
       ctx.scale(-1, 1);
@@ -551,12 +729,33 @@
     }
 
     // ── Detection loop ────────────────────────────────────────────────────────
+    /*
+      detectLoop() is an async function scheduled via requestAnimationFrame.
+      It does NOT run at 60 fps — each call awaits the three neural-network
+      inference steps, which take 50–200 ms on a typical laptop.  The next
+      rAF is only requested after the await resolves, so the loop naturally
+      throttles to whatever throughput the GPU/CPU can sustain.
+
+      Using requestAnimationFrame instead of setInterval has two benefits:
+        1. The browser pauses the loop when the tab is hidden (saves battery).
+        2. Draws are synchronised to the display refresh, eliminating tearing.
+
+      Detection pipeline per frame:
+        detectAllFaces()     → runs ssdMobilenetv1 on the full video frame
+        .withFaceLandmarks() → runs faceLandmark68Net on each detected face crop
+        .withFaceDescriptors()→ aligns each crop using landmarks, then runs
+                                faceRecognitionNet to get the 128-dim descriptor
+
+      faceapi.resizeResults() rescales the returned coordinates from the
+      network's internal input resolution to match the canvas dimensions.
+    */
 
     let running = false;
 
     async function detectLoop() {
       if (!running) return;
 
+      // Measure time since previous frame for FPS readout
       const now = performance.now();
       if (lastFrameTime > 0) {
         const inst = 1000 / (now - lastFrameTime);
@@ -566,19 +765,19 @@
 
       const W = canvas.width, H = canvas.height;
 
-      const detector = currentModel === 'tiny'
-        ? new faceapi.TinyFaceDetectorOptions()
-        : new faceapi.SsdMobilenetv1Options();
+      // Run the full detection + landmark + descriptor pipeline on the current frame
       const detections = await faceapi
-        .detectAllFaces(video, detector)
-        .withFaceLandmarks(currentModel === 'tiny')
+        .detectAllFaces(video, new faceapi.SsdMobilenetv1Options())
+        .withFaceLandmarks()
         .withFaceDescriptors();
 
+      // Scale coordinates from the network's input size to canvas pixel dimensions
       const resized = faceapi.resizeResults(detections, { width: W, height: H });
 
-      // Cache for enrollment button
+      // Snapshot for the enrollment button — captures the descriptor from this frame
       lastDetections = resized.map(d => ({ box: d.detection.box, descriptor: d.descriptor }));
 
+      // Clear the canvas and redraw everything for this frame
       ctx.clearRect(0, 0, W, H);
       if (smoothedFps > 0) drawFps();
 
@@ -593,9 +792,19 @@
         const angleLines = [];
         for (const det of resized) {
           const box  = det.detection.box;
-          const pts  = det.landmarks.positions;
+          const pts  = det.landmarks.positions;  // array of 68 {x,y} points
 
-          // Identify person if we have enrolled faces
+          /*
+            Identity matching
+            ─────────────────
+            faceMatcher.findBestMatch(descriptor) searches all enrolled
+            descriptors and returns the label + Euclidean distance of the
+            closest match.  If the closest distance exceeds the threshold
+            (0.55) it returns label = 'unknown'.
+
+            Confidence displayed as (1 − distance) × 100%: a distance of 0
+            would be a perfect match (100%); distance 0.55 maps to 45%.
+          */
           let label = null, boxColor = 'rgba(255,220,0,0.85)';
           if (faceMatcher) {
             const match = faceMatcher.findBestMatch(det.descriptor);
@@ -614,6 +823,8 @@
           const pose = estimatePose(pts);
           drawPoseAxes(pose);
 
+          // Convert pose values to degrees for the status bar readout.
+          // asin maps the normalised yaw/pitch back to an angle in radians.
           const yawDeg   = rad2deg(Math.asin(Math.max(-1, Math.min(1, pose.yaw))));
           const pitchDeg = rad2deg(Math.asin(Math.max(-1, Math.min(1, pose.pitch))));
           const rollDeg  = rad2deg(pose.roll);
@@ -623,17 +834,27 @@
         infoEl.textContent = angleLines.join(' | ');
       }
 
+      // Schedule the next frame — only after this frame's inference is complete
       requestAnimationFrame(detectLoop);
     }
 
     // ── Startup ───────────────────────────────────────────────────────────────
-
+    /*
+      init() runs once on page load.  Sequence:
+        1. Load the three neural network weight files from CDN (~12 MB total).
+        2. Restore any previously saved enrollments from localStorage.
+        3. Request webcam access via getUserMedia.
+           NOTE: getUserMedia requires a secure context — the page must be
+           served over HTTPS or from localhost.  A bare file:// URL will fail.
+        4. On the 'playing' event (first frame available), size the canvas to
+           match the camera resolution and start the detection loop.
+    */
     async function init() {
       statusEl.className   = '';
-      statusEl.textContent = `Loading ${currentModel} models…`;
+      statusEl.textContent = 'Loading models…';
 
       try {
-        await loadModels(currentModel);
+        await loadModels();
       } catch (err) {
         statusEl.className   = 'error';
         statusEl.textContent = `Model error: ${err.message}`;
@@ -658,6 +879,8 @@
 
       let stream;
       try {
+        // getUserMedia returns a MediaStream containing a video track from
+        // the default camera.  The browser will show a permission prompt.
         stream = await navigator.mediaDevices.getUserMedia({ video: true });
       } catch (err) {
         statusEl.className   = 'error';
@@ -667,6 +890,8 @@
 
       video.srcObject = stream;
 
+      // Wait for the first frame before sizing the canvas — videoWidth/Height
+      // are not available until the stream starts playing.
       video.addEventListener('playing', () => {
         canvas.width  = video.videoWidth;
         canvas.height = video.videoHeight;
@@ -677,6 +902,13 @@
         requestAnimationFrame(detectLoop);
       });
     }
+
+    // document.lastModified reflects the file's Last-Modified HTTP header,
+    // which python3 -m http.server sets from the file's mtime — a reliable
+    // proxy for the last time the source was edited without needing a build step.
+    document.getElementById('footer').textContent =
+      'Last updated: ' + new Date(document.lastModified).toLocaleDateString(
+        'en-US', { year: 'numeric', month: 'long', day: 'numeric' });
 
     init();
   </script>
