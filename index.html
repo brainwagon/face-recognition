@@ -711,6 +711,12 @@
     let lastFrameTime = 0;
     let smoothedFps   = 0;
 
+    // Per-phase timing (EMA-smoothed, ms).  -1 = not yet measured.
+    let smoothedPipelineMs = -1;   // neural-net inference (detect + landmarks + descriptors)
+    let smoothedMatchMs    = -1;   // FaceMatcher DB lookup
+    let smoothedRenderMs   = -1;   // canvas drawing
+    let smoothedOverheadMs = -1;   // everything else in the loop body
+
     function drawFps() {
       const text = `${Math.round(smoothedFps)} fps`;
       ctx.font = 'bold 12px Courier New';
@@ -725,6 +731,51 @@
       ctx.scale(-1, 1);
       ctx.fillStyle = '#7ecfff';
       ctx.fillText(text, canvas.width - bx - bw + pad, by + 14);
+      ctx.restore();
+    }
+
+    function drawTimings() {
+      if (smoothedPipelineMs < 0) return;  // nothing measured yet
+
+      const rows = [
+        ['Neural nets', smoothedPipelineMs],
+        ['DB match',    smoothedMatchMs    < 0 ? 0 : smoothedMatchMs],
+        ['Render',      smoothedRenderMs   < 0 ? 0 : smoothedRenderMs],
+        ['Overhead',    smoothedOverheadMs < 0 ? 0 : smoothedOverheadMs],
+      ];
+
+      ctx.font = 'bold 11px Courier New';
+      const pad    = 6;
+      const lineH  = 16;
+      const labelW = ctx.measureText('Neural nets').width;  // widest label
+      const colGap = 8;
+      const valW   = ctx.measureText('9999.9 ms').width;
+      const bw = pad + labelW + colGap + valW + pad;
+      const bh = pad + rows.length * lineH + Math.floor(pad / 2);
+      const bx = 6;
+      const by = 32;  // 6 (FPS top) + 20 (FPS height) + 6 (gap)
+
+      ctx.fillStyle = 'rgba(0,0,0,0.60)';
+      ctx.fillRect(bx, by, bw, bh);
+
+      // Use the same pre-mirror trick as drawFps / drawLabel: translate to right
+      // edge and flip so the CSS scaleX(-1) on #scene un-mirrors the text.
+      ctx.save();
+      ctx.translate(canvas.width, 0);
+      ctx.scale(-1, 1);
+
+      rows.forEach(([label, ms], i) => {
+        const y       = by + pad + (i + 0.82) * lineH;
+        const originX = canvas.width - bx - bw + pad;  // left edge of box in mirrored space
+
+        ctx.fillStyle = '#aaaaaa';
+        ctx.fillText(label, originX, y);
+
+        // Colour-code by magnitude: green < 16 ms (60 fps budget), yellow < 50, red ≥ 50
+        ctx.fillStyle = ms < 16 ? '#66dd66' : ms < 50 ? '#ffcc44' : '#ff6666';
+        ctx.fillText(ms.toFixed(1) + ' ms', originX + labelW + colGap, y);
+      });
+
       ctx.restore();
     }
 
@@ -755,21 +806,28 @@
     async function detectLoop() {
       if (!running) return;
 
+      const frameStart = performance.now();
+
       // Measure time since previous frame for FPS readout
-      const now = performance.now();
       if (lastFrameTime > 0) {
-        const inst = 1000 / (now - lastFrameTime);
+        const inst = 1000 / (frameStart - lastFrameTime);
         smoothedFps = smoothedFps === 0 ? inst : smoothedFps * 0.85 + inst * 0.15;
       }
-      lastFrameTime = now;
+      lastFrameTime = frameStart;
 
       const W = canvas.width, H = canvas.height;
 
-      // Run the full detection + landmark + descriptor pipeline on the current frame
+      // ── Phase 1: Neural-network inference ────────────────────────────────────
+      // Runs three nets in sequence: SSD MobileNet (detection) → faceLandmark68Net
+      // (landmarks) → faceRecognitionNet (128-dim descriptor per face).
+      const pipelineStart = performance.now();
       const detections = await faceapi
         .detectAllFaces(video, new faceapi.SsdMobilenetv1Options())
         .withFaceLandmarks()
         .withFaceDescriptors();
+      const pipelineMs = performance.now() - pipelineStart;
+      smoothedPipelineMs = smoothedPipelineMs < 0 ? pipelineMs
+                         : smoothedPipelineMs * 0.85 + pipelineMs * 0.15;
 
       // Scale coordinates from the network's input size to canvas pixel dimensions
       const resized = faceapi.resizeResults(detections, { width: W, height: H });
@@ -777,45 +835,44 @@
       // Snapshot for the enrollment button — captures the descriptor from this frame
       lastDetections = resized.map(d => ({ box: d.detection.box, descriptor: d.descriptor }));
 
-      // Clear the canvas and redraw everything for this frame
+      // ── Phase 2: Database matching ────────────────────────────────────────────
+      // FaceMatcher.findBestMatch() is a nearest-neighbour search over all enrolled
+      // descriptors using Euclidean distance in 128-dim embedding space.
+      const matchStart = performance.now();
+      const matches = resized.map(det => {
+        if (!faceMatcher) return { label: null, boxColor: 'rgba(255,220,0,0.85)' };
+        const match = faceMatcher.findBestMatch(det.descriptor);
+        if (match.label !== 'unknown') {
+          return {
+            label:    `${match.label} (${((1 - match.distance) * 100).toFixed(0)}%)`,
+            boxColor: colorFor(match.label),
+          };
+        }
+        return { label: 'Unknown', boxColor: 'rgba(255,100,100,0.85)' };
+      });
+      const matchMs = performance.now() - matchStart;
+      smoothedMatchMs = smoothedMatchMs < 0 ? matchMs
+                      : smoothedMatchMs * 0.85 + matchMs * 0.15;
+
+      // ── Phase 3: Canvas rendering ─────────────────────────────────────────────
+      const renderStart = performance.now();
       ctx.clearRect(0, 0, W, H);
       if (smoothedFps > 0) drawFps();
+      drawTimings();
 
       if (resized.length === 0) {
-        statusEl.className  = '';
+        statusEl.className   = '';
         statusEl.textContent = 'No face detected';
-        infoEl.textContent  = '';
+        infoEl.textContent   = '';
       } else {
         statusEl.className   = 'ready';
         statusEl.textContent = `${resized.length} face${resized.length > 1 ? 's' : ''} detected`;
 
         const angleLines = [];
-        for (const det of resized) {
+        resized.forEach((det, i) => {
           const box  = det.detection.box;
           const pts  = det.landmarks.positions;  // array of 68 {x,y} points
-
-          /*
-            Identity matching
-            ─────────────────
-            faceMatcher.findBestMatch(descriptor) searches all enrolled
-            descriptors and returns the label + Euclidean distance of the
-            closest match.  If the closest distance exceeds the threshold
-            (0.55) it returns label = 'unknown'.
-
-            Confidence displayed as (1 − distance) × 100%: a distance of 0
-            would be a perfect match (100%); distance 0.55 maps to 45%.
-          */
-          let label = null, boxColor = 'rgba(255,220,0,0.85)';
-          if (faceMatcher) {
-            const match = faceMatcher.findBestMatch(det.descriptor);
-            if (match.label !== 'unknown') {
-              label    = `${match.label} (${((1 - match.distance) * 100).toFixed(0)}%)`;
-              boxColor = colorFor(match.label);
-            } else {
-              label    = 'Unknown';
-              boxColor = 'rgba(255,100,100,0.85)';
-            }
-          }
+          const { label, boxColor } = matches[i];
 
           drawBoundingBox(box, boxColor);
           if (label) drawLabel(box, label, boxColor);
@@ -829,10 +886,18 @@
           const pitchDeg = rad2deg(Math.asin(Math.max(-1, Math.min(1, pose.pitch))));
           const rollDeg  = rad2deg(pose.roll);
           const prefix   = label ? `${label}  ` : '';
-          angleLines.push(`${prefix}Yaw ${yawDeg}°  Pitch ${pitchDeg}°  Roll ${rollDeg}°`);
-        }
+          angleLines.push(`${prefix}Yaw ${yawDeg.toFixed(0)}°  Pitch ${pitchDeg.toFixed(0)}°  Roll ${rollDeg.toFixed(0)}°`);
+        });
         infoEl.textContent = angleLines.join(' | ');
       }
+      const renderMs = performance.now() - renderStart;
+      smoothedRenderMs = smoothedRenderMs < 0 ? renderMs
+                       : smoothedRenderMs * 0.85 + renderMs * 0.15;
+
+      // Overhead = everything in the loop not captured by the three timed phases.
+      const overheadMs = Math.max(0, performance.now() - frameStart - pipelineMs - matchMs - renderMs);
+      smoothedOverheadMs = smoothedOverheadMs < 0 ? overheadMs
+                         : smoothedOverheadMs * 0.85 + overheadMs * 0.15;
 
       // Schedule the next frame — only after this frame's inference is complete
       requestAnimationFrame(detectLoop);
