@@ -879,9 +879,13 @@
 
       let stream;
       try {
-        // getUserMedia returns a MediaStream containing a video track from
-        // the default camera.  The browser will show a permission prompt.
-        stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        // SsdMobilenetv1 resizes every frame to 300×300 internally, so there
+        // is no benefit to capturing at HD resolutions — they only slow down
+        // the pipeline.  640×480 @ 30 fps is the sweet spot: enough detail for
+        // reliable detection, small enough to maximise frame rate.
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } }
+        });
       } catch (err) {
         statusEl.className   = 'error';
         statusEl.textContent = `Camera error: ${err.message}`;
