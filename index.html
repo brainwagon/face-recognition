@@ -773,10 +773,12 @@
       video.addEventListener('playing', () => {
         canvas.width  = video.videoWidth;
         canvas.height = video.videoHeight;
+        lastFrameTime = 0;
         running = true;
         statusEl.className   = 'ready';
         statusEl.textContent = 'Ready — detecting…';
-        requestAnimationFrame(detectLoop);
+        loopId++;
+        requestAnimationFrame(() => detectLoop(loopId));
       }, { once: true });
     }
 
@@ -886,9 +888,10 @@
 
     let running = false;
     let currentStream = null;
+    let loopId = 0;   // incremented each time a new loop is started; stale iterations exit
 
-    async function detectLoop() {
-      if (!running) return;
+    async function detectLoop(id) {
+      if (!running || id !== loopId) return;
 
       const frameStart = performance.now();
 
@@ -899,92 +902,96 @@
       }
       lastFrameTime = frameStart;
 
-      const W = canvas.width, H = canvas.height;
+      try {
+        const W = canvas.width, H = canvas.height;
 
-      // ── Phase 1: Neural-network inference ────────────────────────────────────
-      // Runs three nets in sequence: SSD MobileNet (detection) → faceLandmark68Net
-      // (landmarks) → faceRecognitionNet (128-dim descriptor per face).
-      const pipelineStart = performance.now();
-      const detections = await faceapi
-        .detectAllFaces(video, new faceapi.SsdMobilenetv1Options())
-        .withFaceLandmarks()
-        .withFaceDescriptors();
-      const pipelineMs = performance.now() - pipelineStart;
+        // ── Phase 1: Neural-network inference ──────────────────────────────────
+        // Runs three nets in sequence: SSD MobileNet (detection) → faceLandmark68Net
+        // (landmarks) → faceRecognitionNet (128-dim descriptor per face).
+        const pipelineStart = performance.now();
+        const detections = await faceapi
+          .detectAllFaces(video, new faceapi.SsdMobilenetv1Options())
+          .withFaceLandmarks()
+          .withFaceDescriptors();
+        const pipelineMs = performance.now() - pipelineStart;
 
-      // Scale coordinates from the network's input size to canvas pixel dimensions
-      const resized = faceapi.resizeResults(detections, { width: W, height: H });
+        // Scale coordinates from the network's input size to canvas pixel dimensions
+        const resized = faceapi.resizeResults(detections, { width: W, height: H });
 
-      // Snapshot for the enrollment button — captures the descriptor from this frame
-      lastDetections = resized.map(d => ({ box: d.detection.box, descriptor: d.descriptor }));
+        // Snapshot for the enrollment button — captures the descriptor from this frame
+        lastDetections = resized.map(d => ({ box: d.detection.box, descriptor: d.descriptor }));
 
-      // ── Phase 2: Database matching ────────────────────────────────────────────
-      // FaceMatcher.findBestMatch() is a nearest-neighbour search over all enrolled
-      // descriptors using Euclidean distance in 128-dim embedding space.
-      const matchStart = performance.now();
-      const matches = resized.map(det => {
-        if (!faceMatcher) return { label: null, boxColor: 'rgba(255,220,0,0.85)' };
-        const match = faceMatcher.findBestMatch(det.descriptor);
-        if (match.label !== 'unknown') {
-          return {
-            label:    `${match.label} (${((1 - match.distance) * 100).toFixed(0)}%)`,
-            boxColor: colorFor(match.label),
-          };
-        }
-        return { label: 'Unknown', boxColor: 'rgba(255,100,100,0.85)' };
-      });
-      const matchMs = performance.now() - matchStart;
-
-      // ── Phase 3: Canvas rendering ─────────────────────────────────────────────
-      const renderStart = performance.now();
-      ctx.clearRect(0, 0, W, H);
-
-      // Build face drawing commands first so renderMs covers only canvas work,
-      // and compute overhead before any draws so all four timing values are
-      // current-frame figures when drawTimings() reads them.
-      const overheadMs = Math.max(0, performance.now() - frameStart - pipelineMs - matchMs);
-      smoothedPipelineMs = pipelineMs;
-      smoothedMatchMs    = matchMs;
-      smoothedOverheadMs = overheadMs;
-      // smoothedRenderMs will be set at end of this phase; prime it to the
-      // previous frame's value so drawTimings() always has something to show.
-
-      if (smoothedFps > 0) drawFps();
-      drawTimings();
-
-      if (resized.length === 0) {
-        statusEl.className   = '';
-        statusEl.textContent = 'No face detected';
-        infoEl.textContent   = '';
-      } else {
-        statusEl.className   = 'ready';
-        statusEl.textContent = `${resized.length} face${resized.length > 1 ? 's' : ''} detected`;
-
-        const angleLines = [];
-        resized.forEach((det, i) => {
-          const box  = det.detection.box;
-          const pts  = det.landmarks.positions;  // array of 68 {x,y} points
-          const { label, boxColor } = matches[i];
-
-          drawBoundingBox(box, boxColor);
-          if (label) drawLabel(box, label, boxColor);
-          drawLandmarks(pts);
-          const pose = estimatePose(pts);
-          drawPoseAxes(pose);
-
-          // Convert pose values to degrees for the status bar readout.
-          // asin maps the normalised yaw/pitch back to an angle in radians.
-          const yawDeg   = rad2deg(Math.asin(Math.max(-1, Math.min(1, pose.yaw))));
-          const pitchDeg = rad2deg(Math.asin(Math.max(-1, Math.min(1, pose.pitch))));
-          const rollDeg  = rad2deg(pose.roll);
-          const prefix   = label ? `${label}  ` : '';
-          angleLines.push(`${prefix}Yaw ${yawDeg.toFixed(0)}°  Pitch ${pitchDeg.toFixed(0)}°  Roll ${rollDeg.toFixed(0)}°`);
+        // ── Phase 2: Database matching ──────────────────────────────────────────
+        // FaceMatcher.findBestMatch() is a nearest-neighbour search over all enrolled
+        // descriptors using Euclidean distance in 128-dim embedding space.
+        const matchStart = performance.now();
+        const matches = resized.map(det => {
+          if (!faceMatcher) return { label: null, boxColor: 'rgba(255,220,0,0.85)' };
+          const match = faceMatcher.findBestMatch(det.descriptor);
+          if (match.label !== 'unknown') {
+            return {
+              label:    `${match.label} (${((1 - match.distance) * 100).toFixed(0)}%)`,
+              boxColor: colorFor(match.label),
+            };
+          }
+          return { label: 'Unknown', boxColor: 'rgba(255,100,100,0.85)' };
         });
-        infoEl.textContent = angleLines.join(' | ');
-      }
-      smoothedRenderMs = performance.now() - renderStart;
+        const matchMs = performance.now() - matchStart;
 
-      // Schedule the next frame — only after this frame's inference is complete
-      requestAnimationFrame(detectLoop);
+        // ── Phase 3: Canvas rendering ───────────────────────────────────────────
+        const renderStart = performance.now();
+        ctx.clearRect(0, 0, W, H);
+
+        // Build face drawing commands first so renderMs covers only canvas work,
+        // and compute overhead before any draws so all four timing values are
+        // current-frame figures when drawTimings() reads them.
+        const overheadMs = Math.max(0, performance.now() - frameStart - pipelineMs - matchMs);
+        smoothedPipelineMs = pipelineMs;
+        smoothedMatchMs    = matchMs;
+        smoothedOverheadMs = overheadMs;
+        // smoothedRenderMs will be set at end of this phase; prime it to the
+        // previous frame's value so drawTimings() always has something to show.
+
+        if (smoothedFps > 0) drawFps();
+        drawTimings();
+
+        if (resized.length === 0) {
+          statusEl.className   = '';
+          statusEl.textContent = 'No face detected';
+          infoEl.textContent   = '';
+        } else {
+          statusEl.className   = 'ready';
+          statusEl.textContent = `${resized.length} face${resized.length > 1 ? 's' : ''} detected`;
+
+          const angleLines = [];
+          resized.forEach((det, i) => {
+            const box  = det.detection.box;
+            const pts  = det.landmarks.positions;  // array of 68 {x,y} points
+            const { label, boxColor } = matches[i];
+
+            drawBoundingBox(box, boxColor);
+            if (label) drawLabel(box, label, boxColor);
+            drawLandmarks(pts);
+            const pose = estimatePose(pts);
+            drawPoseAxes(pose);
+
+            // Convert pose values to degrees for the status bar readout.
+            // asin maps the normalised yaw/pitch back to an angle in radians.
+            const yawDeg   = rad2deg(Math.asin(Math.max(-1, Math.min(1, pose.yaw))));
+            const pitchDeg = rad2deg(Math.asin(Math.max(-1, Math.min(1, pose.pitch))));
+            const rollDeg  = rad2deg(pose.roll);
+            const prefix   = label ? `${label}  ` : '';
+            angleLines.push(`${prefix}Yaw ${yawDeg.toFixed(0)}°  Pitch ${pitchDeg.toFixed(0)}°  Roll ${rollDeg.toFixed(0)}°`);
+          });
+          infoEl.textContent = angleLines.join(' | ');
+        }
+        smoothedRenderMs = performance.now() - renderStart;
+      } catch (_) {
+        // inference may fail transiently if the video source changes mid-frame; skip
+      }
+
+      // Only reschedule if this is still the active loop generation
+      if (running && id === loopId) requestAnimationFrame(() => detectLoop(id));
     }
 
     // ── Startup ───────────────────────────────────────────────────────────────
@@ -1051,7 +1058,8 @@
         enrollBtn.disabled   = false;
         statusEl.className   = 'ready';
         statusEl.textContent = 'Ready — detecting…';
-        requestAnimationFrame(detectLoop);
+        loopId++;
+        requestAnimationFrame(() => detectLoop(loopId));
         populateCameraSelect();
       }, { once: true });
     }
