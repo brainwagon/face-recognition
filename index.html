@@ -1,0 +1,685 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Face Pose Demo</title>
+  <script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0d0d0f;
+      color: #e0e0e0;
+      font-family: 'Courier New', monospace;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-start;
+      min-height: 100vh;
+      padding: 24px 16px;
+      gap: 16px;
+    }
+
+    h1 {
+      font-size: 1.1rem;
+      letter-spacing: 0.15em;
+      color: #7ecfff;
+      text-transform: uppercase;
+    }
+
+    #scene {
+      position: relative;
+      display: inline-block;
+      transform: scaleX(-1);
+      border: 1px solid #2a2a3a;
+      border-radius: 4px;
+      overflow: hidden;
+      box-shadow: 0 0 32px rgba(100, 180, 255, 0.08);
+    }
+
+    #video { display: block; max-width: 100%; }
+
+    #overlay {
+      position: absolute;
+      top: 0; left: 0;
+      pointer-events: none;
+    }
+
+    #status-bar {
+      display: flex;
+      gap: 24px;
+      align-items: center;
+      font-size: 0.8rem;
+      color: #666;
+      width: 100%;
+      max-width: 640px;
+    }
+
+    #status { color: #7ecfff; min-width: 160px; }
+    #status.error { color: #ff6b6b; }
+    #status.ready  { color: #6bffb8; }
+
+    #info { flex: 1; text-align: right; color: #aaa; letter-spacing: 0.05em; }
+
+    /* ── Enrollment panel ── */
+    #enroll-panel {
+      width: 100%;
+      max-width: 640px;
+      border: 1px solid #2a2a3a;
+      border-radius: 4px;
+      padding: 12px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    #enroll-form {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    #name-input {
+      flex: 1;
+      background: #1a1a2a;
+      border: 1px solid #3a3a5a;
+      border-radius: 3px;
+      color: #e0e0e0;
+      font-family: inherit;
+      font-size: 0.85rem;
+      padding: 6px 10px;
+      outline: none;
+    }
+    #name-input:focus { border-color: #7ecfff; }
+    #name-input::placeholder { color: #444; }
+
+    button {
+      background: #1e2a3a;
+      border: 1px solid #4488ff;
+      border-radius: 3px;
+      color: #7ecfff;
+      font-family: inherit;
+      font-size: 0.8rem;
+      padding: 6px 14px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    button:hover { background: #253348; }
+    button:disabled { opacity: 0.4; cursor: default; }
+
+    #model-form {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 0.8rem;
+      padding-bottom: 10px;
+      border-bottom: 1px solid #2a2a3a;
+    }
+
+    .model-label { color: #666; }
+
+    .model-opt {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      cursor: pointer;
+    }
+
+    .model-opt input[type="radio"] { accent-color: #7ecfff; cursor: pointer; }
+
+    #storage-form {
+      display: flex;
+      gap: 8px;
+    }
+
+    #enroll-msg {
+      font-size: 0.75rem;
+      min-height: 1em;
+      color: #ff6b6b;
+    }
+    #enroll-msg.ok { color: #6bffb8; }
+
+    #enrolled-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .enrolled-entry {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 0.8rem;
+    }
+
+    .enrolled-swatch {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .enrolled-name { flex: 1; }
+    .enrolled-count { color: #555; font-size: 0.75rem; }
+
+    .delete-btn {
+      border-color: #553333;
+      color: #ff6b6b;
+      font-size: 0.7rem;
+      padding: 2px 7px;
+    }
+    .delete-btn:hover { background: #2a1a1a; }
+
+    #legend {
+      display: flex;
+      gap: 20px;
+      font-size: 0.75rem;
+    }
+    .leg { display: flex; align-items: center; gap: 6px; }
+    .dot { width: 12px; height: 4px; border-radius: 2px; }
+  </style>
+</head>
+<body>
+
+  <h1>Face Pose &amp; Recognition Demo</h1>
+
+  <div id="scene">
+    <video id="video" autoplay muted playsinline></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div id="status-bar">
+    <div id="status">Loading models…</div>
+    <div id="info"></div>
+  </div>
+
+  <div id="enroll-panel">
+    <div id="model-form">
+      <span class="model-label">Model:</span>
+      <label class="model-opt"><input type="radio" name="model" value="tiny"> Tiny (fast)</label>
+      <label class="model-opt"><input type="radio" name="model" value="full"> Full (accurate)</label>
+    </div>
+    <div id="enroll-form">
+      <input id="name-input" type="text" placeholder="Enter name to enroll…" maxlength="30">
+      <button id="enroll-btn" disabled>Enroll Face</button>
+    </div>
+    <div id="storage-form">
+      <button id="save-btn">Save to Browser</button>
+      <button id="load-btn">Load from Browser</button>
+      <button id="clear-storage-btn">Clear Saved</button>
+    </div>
+    <div id="enroll-msg"></div>
+    <div id="enrolled-list"></div>
+  </div>
+
+  <div id="legend">
+    <div class="leg"><div class="dot" style="background:#ff4444"></div> Yaw</div>
+    <div class="leg"><div class="dot" style="background:#44ff88"></div> Pitch</div>
+    <div class="leg"><div class="dot" style="background:#4488ff"></div> Roll</div>
+    <div class="leg"><div class="dot" style="background:rgba(0,255,150,0.75)"></div> Landmarks</div>
+  </div>
+
+  <script>
+    const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
+
+    const video     = document.getElementById('video');
+    const canvas    = document.getElementById('overlay');
+    const ctx       = canvas.getContext('2d');
+    const statusEl  = document.getElementById('status');
+    const infoEl    = document.getElementById('info');
+    const enrollBtn = document.getElementById('enroll-btn');
+    const nameInput = document.getElementById('name-input');
+    const enrollMsg = document.getElementById('enroll-msg');
+    const enrolledListEl    = document.getElementById('enrolled-list');
+    const saveBtn           = document.getElementById('save-btn');
+    const loadBtn           = document.getElementById('load-btn');
+    const clearStorageBtn   = document.getElementById('clear-storage-btn');
+    const modelRadios       = document.querySelectorAll('input[name="model"]');
+
+    // ── Model selection ───────────────────────────────────────────────────────
+
+    const MODEL_PREF_KEY = 'face-recognition-model';
+    let currentModel = localStorage.getItem(MODEL_PREF_KEY) || 'tiny';
+    document.querySelector(`input[name="model"][value="${currentModel}"]`).checked = true;
+
+    // ── Per-person colour palette ─────────────────────────────────────────────
+
+    const PALETTE = ['#ff6b6b','#ffd93d','#6bcb77','#4d96ff','#ff6fc8','#c77dff','#ff9f45','#48cae4'];
+    const nameColors = new Map();
+    let colorIdx = 0;
+
+    function colorFor(name) {
+      if (!nameColors.has(name)) {
+        nameColors.set(name, PALETTE[colorIdx % PALETTE.length]);
+        colorIdx++;
+      }
+      return nameColors.get(name);
+    }
+
+    // ── Enrollment store ──────────────────────────────────────────────────────
+
+    // name → Float32Array[]
+    const enrollments = new Map();
+    let faceMatcher = null;
+
+    function rebuildMatcher() {
+      if (enrollments.size === 0) { faceMatcher = null; return; }
+      const labeled = [...enrollments.entries()].map(
+        ([label, descs]) => new faceapi.LabeledFaceDescriptors(label, descs)
+      );
+      faceMatcher = new faceapi.FaceMatcher(labeled, 0.55);
+    }
+
+    function renderEnrolledList() {
+      enrolledListEl.innerHTML = '';
+      for (const [name, descs] of enrollments) {
+        const color = colorFor(name);
+        const row = document.createElement('div');
+        row.className = 'enrolled-entry';
+        row.innerHTML = `
+          <div class="enrolled-swatch" style="background:${color}"></div>
+          <span class="enrolled-name">${name}</span>
+          <span class="enrolled-count">${descs.length} sample${descs.length > 1 ? 's' : ''}</span>
+          <button class="delete-btn" data-name="${name}">✕</button>`;
+        enrolledListEl.appendChild(row);
+      }
+      enrolledListEl.querySelectorAll('.delete-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          enrollments.delete(btn.dataset.name);
+          nameColors.delete(btn.dataset.name);
+          rebuildMatcher();
+          renderEnrolledList();
+          saveToStorage();
+        });
+      });
+    }
+
+    // ── localStorage persistence ──────────────────────────────────────────────
+
+    const storageKey = () => `face-recognition-enrollments-${currentModel}`;
+
+    function saveToStorage() {
+      const data = {};
+      for (const [name, descs] of enrollments) {
+        data[name] = descs.map(d => Array.from(d));
+      }
+      localStorage.setItem(storageKey(), JSON.stringify(data));
+      showEnrollMsg(`Saved ${enrollments.size} person${enrollments.size !== 1 ? 's' : ''} to browser storage.`, true);
+    }
+
+    function loadFromStorage() {
+      const raw = localStorage.getItem(storageKey());
+      if (!raw) { showEnrollMsg('No saved data found.', false); return; }
+      const data = JSON.parse(raw);
+      enrollments.clear();
+      nameColors.clear();
+      colorIdx = 0;
+      for (const [name, arrays] of Object.entries(data)) {
+        enrollments.set(name, arrays.map(a => new Float32Array(a)));
+        colorFor(name);  // assign colour in load order
+      }
+      rebuildMatcher();
+      renderEnrolledList();
+      const total = [...enrollments.values()].reduce((s, d) => s + d.length, 0);
+      showEnrollMsg(`Loaded ${enrollments.size} person${enrollments.size !== 1 ? 's' : ''} (${total} samples).`, true);
+    }
+
+    function clearStorage() {
+      localStorage.removeItem(storageKey());
+      showEnrollMsg('Saved data cleared.', true);
+    }
+
+    saveBtn.addEventListener('click', saveToStorage);
+    loadBtn.addEventListener('click', loadFromStorage);
+    clearStorageBtn.addEventListener('click', clearStorage);
+
+    // ── Latest descriptors from the detection loop ────────────────────────────
+
+    let lastDetections = [];   // [{box, descriptor}]
+
+    enrollBtn.addEventListener('click', () => {
+      const name = nameInput.value.trim();
+      if (!name) {
+        showEnrollMsg('Enter a name first.', false);
+        return;
+      }
+      if (lastDetections.length === 0) {
+        showEnrollMsg('No face detected — position yourself in frame.', false);
+        return;
+      }
+      if (lastDetections.length > 1) {
+        showEnrollMsg('Multiple faces visible — only one person should be in frame.', false);
+        return;
+      }
+      const descriptor = lastDetections[0].descriptor;
+      if (!enrollments.has(name)) enrollments.set(name, []);
+      enrollments.get(name).push(descriptor);
+      rebuildMatcher();
+      renderEnrolledList();
+      saveToStorage();
+      showEnrollMsg(`Enrolled sample ${enrollments.get(name).length} for "${name}".`, true);
+    });
+
+    nameInput.addEventListener('keydown', e => { if (e.key === 'Enter') enrollBtn.click(); });
+
+    function showEnrollMsg(text, ok) {
+      enrollMsg.textContent = text;
+      enrollMsg.className = ok ? 'ok' : '';
+      clearTimeout(enrollMsg._t);
+      enrollMsg._t = setTimeout(() => { enrollMsg.textContent = ''; }, 3000);
+    }
+
+    // ── Geometry helpers ──────────────────────────────────────────────────────
+
+    function mean(pts) {
+      const n = pts.length;
+      return { x: pts.reduce((s,p) => s+p.x, 0)/n, y: pts.reduce((s,p) => s+p.y, 0)/n };
+    }
+
+    function dist(a, b) { return Math.hypot(b.x-a.x, b.y-a.y); }
+    function rad2deg(r) { return (r * 180 / Math.PI).toFixed(1); }
+
+    // ── Head pose from 68-point landmarks (geometric approximation) ───────────
+
+    function estimatePose(pts) {
+      const leftEye  = mean(pts.slice(36, 42));
+      const rightEye = mean(pts.slice(42, 48));
+      const noseTip  = pts[30];
+      const chin     = pts[8];
+      const jawL     = pts[0], jawR = pts[16];
+
+      const roll   = Math.atan2(rightEye.y - leftEye.y, rightEye.x - leftEye.x);
+      const eyeMid = mean([leftEye, rightEye]);
+      const faceH  = dist(eyeMid, chin);
+      const pitch  = (dist(eyeMid, noseTip) / faceH - 0.45) * 2.2;
+      const faceW  = dist(jawL, jawR);
+      const yaw    = (noseTip.x - mean([jawL, jawR]).x) / (faceW * 0.5);
+
+      return { roll, pitch, yaw, noseTip };
+    }
+
+    // ── Canvas drawing ────────────────────────────────────────────────────────
+
+    function drawArrow(ox, oy, dx, dy, color, len) {
+      const ex = ox + dx * len, ey = oy + dy * len;
+      const angle = Math.atan2(ey - oy, ex - ox);
+      ctx.beginPath();
+      ctx.moveTo(ox, oy);
+      ctx.lineTo(ex, ey);
+      ctx.lineTo(ex - 12*Math.cos(angle-0.38), ey - 12*Math.sin(angle-0.38));
+      ctx.moveTo(ex, ey);
+      ctx.lineTo(ex - 12*Math.cos(angle+0.38), ey - 12*Math.sin(angle+0.38));
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 3;
+      ctx.lineJoin = ctx.lineCap = 'round';
+      ctx.stroke();
+    }
+
+    function drawPoseAxes(pose) {
+      const { roll, pitch, yaw, noseTip: { x: ox, y: oy } } = pose;
+      const yc = Math.max(-1, Math.min(1, yaw));
+      const pc = Math.max(-1, Math.min(1, pitch));
+      drawArrow(ox, oy,  Math.cos(roll)*yc,           Math.sin(roll)*yc,           '#ff4444', 80);
+      drawArrow(ox, oy, -Math.sin(roll)*pc,            Math.cos(roll)*pc,           '#44ff88', 80);
+      drawArrow(ox, oy,  Math.cos(roll+Math.PI/2),     Math.sin(roll+Math.PI/2),    '#4488ff', 50);
+    }
+
+    function drawBoundingBox(box, color) {
+      ctx.strokeStyle = color;
+      ctx.lineWidth   = 2;
+      ctx.strokeRect(box.x, box.y, box.width, box.height);
+    }
+
+    function drawLabel(box, text, color) {
+      ctx.font = 'bold 13px Courier New';
+      const w  = ctx.measureText(text).width + 12;
+      const lx = box.x, ly = box.y - 22;
+      ctx.fillStyle = 'rgba(0,0,0,0.65)';
+      ctx.fillRect(lx, Math.max(0, ly), w, 20);
+      // Flip context locally so text appears correct after the CSS scaleX(-1) on #scene
+      ctx.save();
+      ctx.translate(canvas.width, 0);
+      ctx.scale(-1, 1);
+      ctx.fillStyle = color;
+      ctx.fillText(text, canvas.width - lx - w + 6, Math.max(14, ly + 14));
+      ctx.restore();
+    }
+
+    function drawLandmarks(pts) {
+      ctx.fillStyle = 'rgba(0, 255, 150, 0.75)';
+      for (const p of pts) {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    // ── Model loading & switching ─────────────────────────────────────────────
+
+    async function loadModels(modelType) {
+      const nets = modelType === 'tiny'
+        ? [faceapi.nets.tinyFaceDetector, faceapi.nets.faceLandmark68TinyNet]
+        : [faceapi.nets.ssdMobilenetv1,   faceapi.nets.faceLandmark68Net];
+      await Promise.all([
+        ...nets.map(n => n.loadFromUri(MODEL_URL)),
+        faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
+      ]);
+    }
+
+    async function switchModel(modelType) {
+      if (modelType === currentModel) return;
+
+      // Persist current enrollments silently before clearing
+      if (enrollments.size > 0) {
+        const data = {};
+        for (const [name, descs] of enrollments) data[name] = descs.map(d => Array.from(d));
+        localStorage.setItem(storageKey(), JSON.stringify(data));
+      }
+
+      running = false;
+      enrollBtn.disabled = true;
+      modelRadios.forEach(r => r.disabled = true);
+
+      enrollments.clear();
+      nameColors.clear();
+      colorIdx = 0;
+      faceMatcher = null;
+      lastDetections = [];
+      lastFrameTime = 0;
+      smoothedFps = 0;
+      renderEnrolledList();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      currentModel = modelType;
+      localStorage.setItem(MODEL_PREF_KEY, currentModel);
+
+      statusEl.className   = '';
+      statusEl.textContent = `Loading ${modelType} models…`;
+
+      try {
+        await loadModels(modelType);
+      } catch (err) {
+        statusEl.className   = 'error';
+        statusEl.textContent = `Model error: ${err.message}`;
+        modelRadios.forEach(r => r.disabled = false);
+        return;
+      }
+
+      // Restore any enrollments saved under the new model
+      const savedRaw = localStorage.getItem(storageKey());
+      if (savedRaw) {
+        try {
+          const data = JSON.parse(savedRaw);
+          for (const [name, arrays] of Object.entries(data)) {
+            enrollments.set(name, arrays.map(a => new Float32Array(a)));
+            colorFor(name);
+          }
+          rebuildMatcher();
+          renderEnrolledList();
+        } catch (e) { /* corrupt — ignore */ }
+      }
+
+      running = true;
+      enrollBtn.disabled   = false;
+      modelRadios.forEach(r => r.disabled = false);
+      statusEl.className   = 'ready';
+      statusEl.textContent = 'Ready — detecting…';
+      requestAnimationFrame(detectLoop);
+    }
+
+    modelRadios.forEach(r => r.addEventListener('change', () => switchModel(r.value)));
+
+    // ── FPS tracking ─────────────────────────────────────────────────────────
+
+    let lastFrameTime = 0;
+    let smoothedFps   = 0;
+
+    function drawFps() {
+      const text = `${Math.round(smoothedFps)} fps`;
+      ctx.font = 'bold 12px Courier New';
+      const tw  = ctx.measureText(text).width;
+      const pad = 6;
+      const bx  = 6, by = 6, bw = tw + pad * 2, bh = 20;
+      ctx.fillStyle = 'rgba(0,0,0,0.55)';
+      ctx.fillRect(bx, by, bw, bh);
+      ctx.save();
+      ctx.translate(canvas.width, 0);
+      ctx.scale(-1, 1);
+      ctx.fillStyle = '#7ecfff';
+      ctx.fillText(text, canvas.width - bx - bw + pad, by + 14);
+      ctx.restore();
+    }
+
+    // ── Detection loop ────────────────────────────────────────────────────────
+
+    let running = false;
+
+    async function detectLoop() {
+      if (!running) return;
+
+      const now = performance.now();
+      if (lastFrameTime > 0) {
+        const inst = 1000 / (now - lastFrameTime);
+        smoothedFps = smoothedFps === 0 ? inst : smoothedFps * 0.85 + inst * 0.15;
+      }
+      lastFrameTime = now;
+
+      const W = canvas.width, H = canvas.height;
+
+      const detector = currentModel === 'tiny'
+        ? new faceapi.TinyFaceDetectorOptions()
+        : new faceapi.SsdMobilenetv1Options();
+      const detections = await faceapi
+        .detectAllFaces(video, detector)
+        .withFaceLandmarks(currentModel === 'tiny')
+        .withFaceDescriptors();
+
+      const resized = faceapi.resizeResults(detections, { width: W, height: H });
+
+      // Cache for enrollment button
+      lastDetections = resized.map(d => ({ box: d.detection.box, descriptor: d.descriptor }));
+
+      ctx.clearRect(0, 0, W, H);
+      if (smoothedFps > 0) drawFps();
+
+      if (resized.length === 0) {
+        statusEl.className  = '';
+        statusEl.textContent = 'No face detected';
+        infoEl.textContent  = '';
+      } else {
+        statusEl.className   = 'ready';
+        statusEl.textContent = `${resized.length} face${resized.length > 1 ? 's' : ''} detected`;
+
+        const angleLines = [];
+        for (const det of resized) {
+          const box  = det.detection.box;
+          const pts  = det.landmarks.positions;
+
+          // Identify person if we have enrolled faces
+          let label = null, boxColor = 'rgba(255,220,0,0.85)';
+          if (faceMatcher) {
+            const match = faceMatcher.findBestMatch(det.descriptor);
+            if (match.label !== 'unknown') {
+              label    = `${match.label} (${((1 - match.distance) * 100).toFixed(0)}%)`;
+              boxColor = colorFor(match.label);
+            } else {
+              label    = 'Unknown';
+              boxColor = 'rgba(255,100,100,0.85)';
+            }
+          }
+
+          drawBoundingBox(box, boxColor);
+          if (label) drawLabel(box, label, boxColor);
+          drawLandmarks(pts);
+          const pose = estimatePose(pts);
+          drawPoseAxes(pose);
+
+          const yawDeg   = rad2deg(Math.asin(Math.max(-1, Math.min(1, pose.yaw))));
+          const pitchDeg = rad2deg(Math.asin(Math.max(-1, Math.min(1, pose.pitch))));
+          const rollDeg  = rad2deg(pose.roll);
+          const prefix   = label ? `${label}  ` : '';
+          angleLines.push(`${prefix}Yaw ${yawDeg}°  Pitch ${pitchDeg}°  Roll ${rollDeg}°`);
+        }
+        infoEl.textContent = angleLines.join(' | ');
+      }
+
+      requestAnimationFrame(detectLoop);
+    }
+
+    // ── Startup ───────────────────────────────────────────────────────────────
+
+    async function init() {
+      statusEl.className   = '';
+      statusEl.textContent = `Loading ${currentModel} models…`;
+
+      try {
+        await loadModels(currentModel);
+      } catch (err) {
+        statusEl.className   = 'error';
+        statusEl.textContent = `Model error: ${err.message}`;
+        return;
+      }
+
+      // Restore any previously saved enrollments before starting the camera
+      const savedRaw = localStorage.getItem(storageKey());
+      if (savedRaw) {
+        try {
+          const data = JSON.parse(savedRaw);
+          for (const [name, arrays] of Object.entries(data)) {
+            enrollments.set(name, arrays.map(a => new Float32Array(a)));
+            colorFor(name);
+          }
+          rebuildMatcher();
+          renderEnrolledList();
+        } catch (e) { /* corrupt data — ignore */ }
+      }
+
+      statusEl.textContent = 'Requesting camera…';
+
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      } catch (err) {
+        statusEl.className   = 'error';
+        statusEl.textContent = `Camera error: ${err.message}`;
+        return;
+      }
+
+      video.srcObject = stream;
+
+      video.addEventListener('playing', () => {
+        canvas.width  = video.videoWidth;
+        canvas.height = video.videoHeight;
+        running = true;
+        enrollBtn.disabled   = false;
+        statusEl.className   = 'ready';
+        statusEl.textContent = 'Ready — detecting…';
+        requestAnimationFrame(detectLoop);
+      });
+    }
+
+    init();
+  </script>
+
+</body>
+</html>
